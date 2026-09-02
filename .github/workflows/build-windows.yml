@@ -4,12 +4,16 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
   build-windows:
     runs-on: windows-latest
+
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -19,18 +23,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-         	
 
       - name: Install frontend dependencies
-        run: pnpm install 
+        run: pnpm install
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: x86_64-pc-windows-msvc
 
-      - name: Build Tauri Windows bundles
+      - name: Build Windows installers
         run: pnpm tauri build --bundles nsis,msi
 
       - name: Upload Windows installers
