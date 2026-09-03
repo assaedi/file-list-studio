@@ -2,17 +2,23 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open, save } from '@tauri-apps/plugin-dialog';
+import { listen } from '@tauri-apps/api/event';
+import * as XLSX from 'xlsx';
 const requiredColumns = ['name', 'modified', 'created', 'kind', 'size', 'path', 'comments', 'tags', 'title', 'md5', 'sha256'];
-const optionalColumns = ['version', 'pages', 'authors', 'album', 'trackNo', 'genre', 'year', 'duration', 'audioBitRate', 'audioSampleRate', 'audioChannels', 'dimensions', 'pixelWidth', 'pixelHeight', 'cameraMake', 'cameraModelName', 'dateTaken', 'iso', 'fNumber', 'focalLength', 'latitude', 'longitude', 'mapsUrl'];
+const optionalColumns = ['thumbnail', 'width', 'height', 'duration', 'bitRate', 'sampleRate', 'channels', 'cameraMake', 'cameraModel', 'dateTaken', 'iso', 'fNumber', 'focalLength', 'album', 'artist', 'version', 'pages', 'authors', 'trackNo', 'genre', 'year', 'audioBitRate', 'audioSampleRate', 'audioChannels', 'dimensions', 'pixelWidth', 'pixelHeight', 'cameraModelName', 'latitude', 'longitude', 'mapsUrl'];
 const defaultVisibleColumns = ['name', 'modified', 'kind', 'size', 'path', 'comments', 'tags', 'title', 'md5', 'sha256'];
+const columnLabelsEn = { name: 'File name', modified: 'Modified', created: 'Created', kind: 'Type', size: 'Size', path: 'Path', comments: 'Comments', tags: 'Tags', title: 'Title', md5: 'MD5', sha256: 'SHA-256', thumbnail: 'Preview', width: 'Width', height: 'Height', duration: 'Duration', bitRate: 'Bit rate', sampleRate: 'Sample rate', channels: 'Channels', cameraMake: 'Camera make', cameraModel: 'Camera model', dateTaken: 'Date taken', iso: 'ISO', fNumber: 'F-Number', focalLength: 'Focal length', latitude: 'Latitude', longitude: 'Longitude', album: 'Album', artist: 'Artist' };
 const columnLabels = {
     name: 'اسم الملف', modified: 'تاريخ التعديل', created: 'تاريخ الإنشاء', kind: 'النوع', size: 'الحجم', path: 'المسار',
     comments: 'التعليقات', tags: 'الوسوم', title: 'العنوان', md5: 'MD5', sha256: 'SHA-256', version: 'الإصدار', pages: 'الصفحات',
     authors: 'المؤلفون / الفنان', album: 'الألبوم', trackNo: 'رقم المسار', genre: 'النوع الموسيقي', year: 'السنة', duration: 'المدة',
     audioBitRate: 'معدل بت الصوت', audioSampleRate: 'معدل عينات الصوت', audioChannels: 'قنوات الصوت', dimensions: 'الأبعاد',
     pixelWidth: 'عرض البكسل', pixelHeight: 'ارتفاع البكسل', cameraMake: 'صانع الكاميرا', cameraModelName: 'طراز الكاميرا',
-    dateTaken: 'تاريخ الالتقاط', iso: 'ISO', fNumber: 'F-Number', focalLength: 'البعد البؤري', latitude: 'خط العرض', longitude: 'خط الطول', mapsUrl: 'رابط الخرائط'
+    dateTaken: 'تاريخ الالتقاط', iso: 'ISO', fNumber: 'F-Number', focalLength: 'البعد البؤري', latitude: 'خط العرض', longitude: 'خط الطول', mapsUrl: 'رابط الخرائط', thumbnail: 'معاينة', width: 'العرض', height: 'الارتفاع', bitRate: 'معدل البت', sampleRate: 'معدل العينات', channels: 'القنوات', cameraModel: 'طراز الكاميرا', artist: 'الفنان'
 };
+function localizedColumnLabel(column) { return language.value === 'en' ? (columnLabelsEn[column] ?? columnLabels[column]) : columnLabels[column]; }
+const copy = { ar: { title: 'منشئ قوائم الملفات', subtitle: 'افحص الملفات المحلية، حرّر بياناتها، واحفظ قائمة منظمة.', choose: 'اختيار مجلد', hashes: 'حساب البصمات', csv: 'تصدير CSV', xlsx: 'تصدير XLSX', save: 'حفظ مشروع', load: 'فتح مشروع', clear: 'مسح النتائج', cancel: 'إلغاء العملية', status: 'حالة العملية', filters: 'تصفية النتائج' }, en: { title: 'File List Studio', subtitle: 'Scan local files, enrich metadata, and export an organized catalog.', choose: 'Choose folder', hashes: 'Calculate hashes', csv: 'Export CSV', xlsx: 'Export XLSX', save: 'Save project', load: 'Open project', clear: 'Clear results', cancel: 'Cancel operation', status: 'Operation status', filters: 'Filter results' } };
+function t(key) { return copy[language.value][key]; }
 const rows = ref([]);
 const selectedIds = ref(new Set());
 const visibleColumns = ref([...defaultVisibleColumns]);
@@ -28,7 +34,14 @@ const errors = ref([]);
 const isColumnPanelOpen = ref(false);
 const isBusy = computed(() => state.value === 'scanning');
 const hashProgress = ref({ current: 0, total: 0 });
+const scanProgress = ref({ current: 0, total: 0, path: '', stage: '' });
+const excludedDirs = ref('');
+const excludedExtensions = ref('');
+const language = ref('ar');
+const currentJobId = ref('');
 let stopDragListener;
+let stopScanProgress;
+let stopHashProgress;
 const editableColumns = new Set(['name', 'comments', 'tags', 'title']);
 const imageExtensions = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tif', 'tiff', 'heic', 'svg', 'raw', 'cr2', 'nef', 'arw']);
 const videoExtensions = new Set(['mp4', 'mov', 'mkv', 'avi', 'webm', 'wmv', 'm4v', 'mpeg', 'mpg']);
@@ -52,6 +65,8 @@ const filteredRows = computed(() => {
 const selectedVisibleCount = computed(() => filteredRows.value.filter((row) => selectedIds.value.has(row.id)).length);
 const allVisibleSelected = computed(() => filteredRows.value.length > 0 && filteredRows.value.every((row) => selectedIds.value.has(row.id)));
 const statusTone = computed(() => state.value === 'error' ? 'danger' : state.value === 'completed' ? 'success' : state.value === 'scanning' ? 'working' : 'neutral');
+const activeProgress = computed(() => scanProgress.value.total > 0 && hashProgress.value.total === 0 ? scanProgress.value : hashProgress.value);
+const progressPercent = computed(() => activeProgress.value.total > 0 ? Math.min(100, Math.round(activeProgress.value.current / activeProgress.value.total * 100)) : 0);
 function normalizeExtension(value) {
     const cleaned = value.trim().toLocaleLowerCase();
     return cleaned.startsWith('.') ? cleaned.slice(1) : cleaned;
@@ -129,9 +144,11 @@ async function startScan(paths) {
     state.value = 'scanning';
     errors.value = [];
     hashProgress.value = { current: 0, total: 0 };
+    currentJobId.value = `scan-${Date.now()}`;
     statusMessage.value = 'جارٍ فحص الملفات والمجلدات من خلال النظام…';
+    scanProgress.value = { current: 0, total: 0, path: '', stage: 'scanning' };
     try {
-        const response = await invoke('scan_entries', { paths, recursive: includeSubfolders.value });
+        const response = await invoke('scan_entries', { paths, recursive: includeSubfolders.value, excludedDirs: excludedDirs.value.split(',').map((item) => item.trim()).filter(Boolean), excludedExtensions: excludedExtensions.value.split(',').map((item) => item.trim()).filter(Boolean), jobId: currentJobId.value });
         statusForScan(response, paths.length);
     }
     catch (error) {
@@ -156,23 +173,19 @@ async function calculateHashes() {
     state.value = 'scanning';
     errors.value = [];
     hashProgress.value = { current: 0, total: targets.length };
+    currentJobId.value = `hash-${Date.now()}`;
     statusMessage.value = `جارٍ حساب البصمات: 0 من ${targets.length}…`;
-    for (const [index, row] of targets.entries()) {
-        try {
-            const result = await invoke('calculate_hashes', { paths: [row.path] });
-            const item = result[0];
-            if (item?.error)
-                errors.value.push(`${row.path}: ${item.error}`);
-            else if (item) {
-                row.md5 = item.md5;
-                row.sha256 = item.sha256;
-            }
-        }
-        catch (error) {
-            errors.value.push(`${row.path}: ${String(error)}`);
-        }
-        hashProgress.value = { current: index + 1, total: targets.length };
-        statusMessage.value = `جارٍ حساب البصمات: ${index + 1} من ${targets.length}…`;
+    try {
+        const result = await invoke('calculate_hashes', { paths: targets.map((row) => row.path), jobId: currentJobId.value });
+        result.forEach((item) => { const row = targets.find((candidate) => candidate.path === item.path); if (item.error)
+            errors.value.push(`${item.path}: ${item.error}`);
+        else if (row) {
+            row.md5 = item.md5;
+            row.sha256 = item.sha256;
+        } });
+    }
+    catch (error) {
+        errors.value.push(String(error));
     }
     state.value = errors.value.length > 0 ? 'error' : 'completed';
     statusMessage.value = `اكتمل حساب البصمات لـ ${targets.length} ملف${errors.value.length ? ` مع ${errors.value.length} أخطاء` : ''}.`;
@@ -202,12 +215,79 @@ async function exportCsv() {
         errors.value = [String(error)];
     }
 }
-function clearRows() {
+async function saveProject() {
+    if (rows.value.length === 0) {
+        statusMessage.value = 'لا توجد نتائج لحفظها كمشروع.';
+        return;
+    }
+    const path = await save({ title: 'حفظ مشروع File List Studio', defaultPath: 'file-list-project.flsp', filters: [{ name: 'File List Project', extensions: ['flsp', 'json'] }] });
+    if (!path)
+        return;
+    try {
+        await invoke('save_project', { path, project: { version: 1, entries: rows.value, visibleColumns: visibleColumns.value, excludedDirs: excludedDirs.value.split(',').map((item) => item.trim()).filter(Boolean), excludedExtensions: excludedExtensions.value.split(',').map((item) => item.trim()).filter(Boolean) } });
+        statusMessage.value = `تم حفظ المشروع في ${path}.`;
+    }
+    catch (error) {
+        errors.value = [String(error)];
+        state.value = 'error';
+        statusMessage.value = `فشل حفظ المشروع: ${String(error)}`;
+    }
+}
+async function loadProject() {
+    const path = await open({ title: 'فتح مشروع File List Studio', multiple: false, filters: [{ name: 'File List Project', extensions: ['flsp', 'json'] }] });
+    if (typeof path !== 'string')
+        return;
+    try {
+        const project = await invoke('load_project', { path });
+        rows.value = project.entries;
+        visibleColumns.value = project.visibleColumns;
+        excludedDirs.value = project.excludedDirs.join(', ');
+        excludedExtensions.value = project.excludedExtensions.join(', ');
+        selectedIds.value = new Set();
+        state.value = 'completed';
+        statusMessage.value = `تم فتح ${rows.value.length.toLocaleString()} سجلًا من المشروع.`;
+    }
+    catch (error) {
+        errors.value = [String(error)];
+        state.value = 'error';
+        statusMessage.value = `فشل فتح المشروع: ${String(error)}`;
+    }
+}
+async function exportXlsx() {
+    if (filteredRows.value.length === 0 || visibleColumns.value.length === 0) {
+        statusMessage.value = 'لا توجد بيانات للتصدير.';
+        return;
+    }
+    const path = await save({ title: 'احفظ ملف Excel', defaultPath: 'file-list.xlsx', filters: [{ name: 'Excel Workbook', extensions: ['xlsx'] }] });
+    if (!path)
+        return;
+    const data = filteredRows.value.map((row) => Object.fromEntries(visibleColumns.value.map((column) => [columnLabels[column], displayValue(row, column)])));
+    const workbook = XLSX.utils.book_new();
+    const sheet = XLSX.utils.json_to_sheet(data);
+    XLSX.utils.book_append_sheet(workbook, sheet, 'File List');
+    const base64 = XLSX.write(workbook, { bookType: 'xlsx', type: 'base64' });
+    try {
+        await invoke('save_binary_base64', { path, content: base64 });
+        statusMessage.value = `تم تصدير ${filteredRows.value.length.toLocaleString()} سجل إلى Excel.`;
+    }
+    catch (error) {
+        errors.value = [String(error)];
+        state.value = 'error';
+        statusMessage.value = `فشل تصدير Excel: ${String(error)}`;
+    }
+}
+async function clearRows() {
     rows.value = [];
     selectedIds.value = new Set();
     state.value = 'idle';
     errors.value = [];
     statusMessage.value = 'تم مسح النتائج.';
+}
+async function cancelCurrent() {
+    if (!currentJobId.value)
+        return;
+    await invoke(state.value === 'scanning' && hashProgress.value.total > 0 ? 'cancel_hashes' : 'cancel_scan', { jobId: currentJobId.value });
+    statusMessage.value = 'تم طلب إلغاء العملية…';
 }
 function handleInputDrop(paths) {
     if (paths.length > 0)
@@ -222,6 +302,8 @@ onMounted(async () => {
         }
         catch { /* Use defaults when storage is invalid. */ }
     }
+    stopScanProgress = await listen('scan-progress', (event) => { scanProgress.value = event.payload; statusMessage.value = event.payload.cancelled ? 'تم إلغاء الفحص.' : `جارٍ الفحص: ${event.payload.current.toLocaleString()} من ${event.payload.total.toLocaleString()}`; });
+    stopHashProgress = await listen('hash-progress', (event) => { hashProgress.value = { current: event.payload.current, total: event.payload.total }; statusMessage.value = `جارٍ حساب البصمات: ${event.payload.current.toLocaleString()} من ${event.payload.total.toLocaleString()}`; });
     const window = getCurrentWindow();
     const unlisten = await window.onDragDropEvent((event) => {
         const payload = event.payload;
@@ -230,13 +312,14 @@ onMounted(async () => {
     });
     stopDragListener = unlisten;
 });
-onBeforeUnmount(() => stopDragListener?.());
+onBeforeUnmount(() => { stopDragListener?.(); stopScanProgress?.(); stopHashProgress?.(); });
 debugger; /* PartiallyEnd: #3632/scriptSetup.vue */
 const __VLS_ctx = {};
 let __VLS_components;
 let __VLS_directives;
 __VLS_asFunctionalElement(__VLS_intrinsicElements.main, __VLS_intrinsicElements.main)({
     ...{ class: "shell" },
+    dir: (__VLS_ctx.language === 'ar' ? 'rtl' : 'ltr'),
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.header, __VLS_intrinsicElements.header)({
     ...{ class: "app-header" },
@@ -246,9 +329,11 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)(
     ...{ class: "eyebrow" },
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.h1, __VLS_intrinsicElements.h1)({});
+(__VLS_ctx.t('title'));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
     ...{ class: "subtitle" },
 });
+(__VLS_ctx.t('subtitle'));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
     ...{ class: "header-actions" },
 });
@@ -265,6 +350,21 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElement
     ...{ class: "button secondary" },
     disabled: (__VLS_ctx.isBusy),
 });
+(__VLS_ctx.t('clear'));
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (...[$event]) => {
+            __VLS_ctx.language = __VLS_ctx.language === 'ar' ? 'en' : 'ar';
+        } },
+    ...{ class: "button secondary" },
+});
+(__VLS_ctx.language === 'ar' ? 'English' : 'العربية');
+if (__VLS_ctx.isBusy) {
+    __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+        ...{ onClick: (__VLS_ctx.cancelCurrent) },
+        ...{ class: "button danger" },
+    });
+    (__VLS_ctx.t('cancel'));
+}
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "toolbar card" },
 });
@@ -279,6 +379,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElement
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
     ...{ class: "button-icon" },
 });
+(__VLS_ctx.t('choose'));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
     ...{ onClick: (__VLS_ctx.calculateHashes) },
     ...{ class: "button secondary" },
@@ -287,6 +388,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElement
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
     ...{ class: "button-icon" },
 });
+(__VLS_ctx.t('hashes'));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
     ...{ onClick: (__VLS_ctx.exportCsv) },
     ...{ class: "button secondary" },
@@ -295,6 +397,25 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElement
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
     ...{ class: "button-icon" },
 });
+(__VLS_ctx.t('csv'));
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (__VLS_ctx.exportXlsx) },
+    ...{ class: "button secondary" },
+    disabled: (__VLS_ctx.isBusy || __VLS_ctx.filteredRows.length === 0),
+});
+(__VLS_ctx.t('xlsx'));
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (__VLS_ctx.saveProject) },
+    ...{ class: "button secondary" },
+    disabled: (__VLS_ctx.isBusy || __VLS_ctx.rows.length === 0),
+});
+(__VLS_ctx.t('save'));
+__VLS_asFunctionalElement(__VLS_intrinsicElements.button, __VLS_intrinsicElements.button)({
+    ...{ onClick: (__VLS_ctx.loadProject) },
+    ...{ class: "button secondary" },
+    disabled: (__VLS_ctx.isBusy),
+});
+(__VLS_ctx.t('load'));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
     ...{ class: "toggle-control" },
 });
@@ -330,6 +451,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)(
     ...{ class: "eyebrow" },
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
+(__VLS_ctx.t('filters'));
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
     ...{ class: "record-count" },
 });
@@ -384,6 +506,22 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.input)({
 __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
     ...{ class: "search-mark" },
 });
+__VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
+    ...{ class: "field" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.input)({
+    placeholder: "node_modules, .git",
+});
+(__VLS_ctx.excludedDirs);
+__VLS_asFunctionalElement(__VLS_intrinsicElements.label, __VLS_intrinsicElements.label)({
+    ...{ class: "field" },
+});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
+__VLS_asFunctionalElement(__VLS_intrinsicElements.input)({
+    placeholder: "tmp, cache, log",
+});
+(__VLS_ctx.excludedExtensions);
 __VLS_asFunctionalElement(__VLS_intrinsicElements.section, __VLS_intrinsicElements.section)({
     ...{ class: "table-card card" },
 });
@@ -443,7 +581,7 @@ if (__VLS_ctx.isColumnPanelOpen) {
             checked: (__VLS_ctx.visibleColumns.includes(column)),
         });
         __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({});
-        (__VLS_ctx.columnLabels[column]);
+        (__VLS_ctx.localizedColumnLabel(column));
         if (__VLS_ctx.optionalColumns.includes(column)) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.small, __VLS_intrinsicElements.small)({});
         }
@@ -499,7 +637,7 @@ else {
             key: (column),
             ...{ class: ({ sortable: ['name', 'size', 'modified'].includes(column) }) },
         });
-        (__VLS_ctx.columnLabels[column]);
+        (__VLS_ctx.localizedColumnLabel(column));
         if (__VLS_ctx.sortBy === column) {
             __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
                 ...{ class: "sort-mark" },
@@ -532,12 +670,21 @@ else {
                 key: (column),
                 ...{ class: (`cell-${column}`) },
             });
-            if (__VLS_ctx.editableColumns.has(column)) {
+            if (column === 'thumbnail' && row.thumbnail) {
+                __VLS_asFunctionalElement(__VLS_intrinsicElements.img)({
+                    ...{ class: "thumbnail" },
+                    src: (row.thumbnail),
+                    alt: (row.name),
+                });
+            }
+            else if (__VLS_ctx.editableColumns.has(column)) {
                 __VLS_asFunctionalElement(__VLS_intrinsicElements.input)({
                     ...{ onInput: (...[$event]) => {
                             if (!!(__VLS_ctx.rows.length === 0))
                                 return;
                             if (!!(__VLS_ctx.filteredRows.length === 0))
+                                return;
+                            if (!!(column === 'thumbnail' && row.thumbnail))
                                 return;
                             if (!(__VLS_ctx.editableColumns.has(column)))
                                 return;
@@ -567,23 +714,25 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)(
     ...{ class: "eyebrow" },
 });
 __VLS_asFunctionalElement(__VLS_intrinsicElements.h2, __VLS_intrinsicElements.h2)({});
-if (__VLS_ctx.hashProgress.total > 0) {
+(__VLS_ctx.t('status'));
+if (__VLS_ctx.activeProgress.total > 0) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span, __VLS_intrinsicElements.span)({
         ...{ class: "progress-label" },
     });
-    (__VLS_ctx.hashProgress.current);
-    (__VLS_ctx.hashProgress.total);
+    (__VLS_ctx.activeProgress.current);
+    (__VLS_ctx.activeProgress.total);
+    (__VLS_ctx.progressPercent);
 }
 __VLS_asFunctionalElement(__VLS_intrinsicElements.p, __VLS_intrinsicElements.p)({
     ...{ class: "status-message" },
 });
 (__VLS_ctx.statusMessage);
-if (__VLS_ctx.hashProgress.total > 0) {
+if (__VLS_ctx.activeProgress.total > 0) {
     __VLS_asFunctionalElement(__VLS_intrinsicElements.div, __VLS_intrinsicElements.div)({
         ...{ class: "progress-track" },
     });
     __VLS_asFunctionalElement(__VLS_intrinsicElements.span)({
-        ...{ style: ({ width: `${(__VLS_ctx.hashProgress.current / __VLS_ctx.hashProgress.total) * 100}%` }) },
+        ...{ style: ({ width: `${__VLS_ctx.progressPercent}%` }) },
     });
 }
 if (__VLS_ctx.errors.length > 0) {
@@ -616,6 +765,10 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.footer, __VLS_intrinsicElement
 /** @type {__VLS_StyleScopedClasses['state-dot']} */ ;
 /** @type {__VLS_StyleScopedClasses['button']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary']} */ ;
+/** @type {__VLS_StyleScopedClasses['button']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary']} */ ;
+/** @type {__VLS_StyleScopedClasses['button']} */ ;
+/** @type {__VLS_StyleScopedClasses['danger']} */ ;
 /** @type {__VLS_StyleScopedClasses['toolbar']} */ ;
 /** @type {__VLS_StyleScopedClasses['card']} */ ;
 /** @type {__VLS_StyleScopedClasses['toolbar-actions']} */ ;
@@ -628,6 +781,12 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.footer, __VLS_intrinsicElement
 /** @type {__VLS_StyleScopedClasses['button']} */ ;
 /** @type {__VLS_StyleScopedClasses['secondary']} */ ;
 /** @type {__VLS_StyleScopedClasses['button-icon']} */ ;
+/** @type {__VLS_StyleScopedClasses['button']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary']} */ ;
+/** @type {__VLS_StyleScopedClasses['button']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary']} */ ;
+/** @type {__VLS_StyleScopedClasses['button']} */ ;
+/** @type {__VLS_StyleScopedClasses['secondary']} */ ;
 /** @type {__VLS_StyleScopedClasses['toggle-control']} */ ;
 /** @type {__VLS_StyleScopedClasses['toggle']} */ ;
 /** @type {__VLS_StyleScopedClasses['drop-zone']} */ ;
@@ -646,6 +805,8 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.footer, __VLS_intrinsicElement
 /** @type {__VLS_StyleScopedClasses['field']} */ ;
 /** @type {__VLS_StyleScopedClasses['search-field']} */ ;
 /** @type {__VLS_StyleScopedClasses['search-mark']} */ ;
+/** @type {__VLS_StyleScopedClasses['field']} */ ;
+/** @type {__VLS_StyleScopedClasses['field']} */ ;
 /** @type {__VLS_StyleScopedClasses['table-card']} */ ;
 /** @type {__VLS_StyleScopedClasses['card']} */ ;
 /** @type {__VLS_StyleScopedClasses['table-toolbar']} */ ;
@@ -668,6 +829,7 @@ __VLS_asFunctionalElement(__VLS_intrinsicElements.footer, __VLS_intrinsicElement
 /** @type {__VLS_StyleScopedClasses['sort-mark']} */ ;
 /** @type {__VLS_StyleScopedClasses['selected']} */ ;
 /** @type {__VLS_StyleScopedClasses['selection-cell']} */ ;
+/** @type {__VLS_StyleScopedClasses['thumbnail']} */ ;
 /** @type {__VLS_StyleScopedClasses['cell-input']} */ ;
 /** @type {__VLS_StyleScopedClasses['status-card']} */ ;
 /** @type {__VLS_StyleScopedClasses['card']} */ ;
@@ -683,7 +845,8 @@ const __VLS_self = (await import('vue')).defineComponent({
         return {
             requiredColumns: requiredColumns,
             optionalColumns: optionalColumns,
-            columnLabels: columnLabels,
+            localizedColumnLabel: localizedColumnLabel,
+            t: t,
             rows: rows,
             selectedIds: selectedIds,
             visibleColumns: visibleColumns,
@@ -698,12 +861,16 @@ const __VLS_self = (await import('vue')).defineComponent({
             errors: errors,
             isColumnPanelOpen: isColumnPanelOpen,
             isBusy: isBusy,
-            hashProgress: hashProgress,
+            excludedDirs: excludedDirs,
+            excludedExtensions: excludedExtensions,
+            language: language,
             editableColumns: editableColumns,
             filteredRows: filteredRows,
             selectedVisibleCount: selectedVisibleCount,
             allVisibleSelected: allVisibleSelected,
             statusTone: statusTone,
+            activeProgress: activeProgress,
+            progressPercent: progressPercent,
             displayValue: displayValue,
             toggleSort: toggleSort,
             toggleColumn: toggleColumn,
@@ -713,7 +880,11 @@ const __VLS_self = (await import('vue')).defineComponent({
             chooseFolder: chooseFolder,
             calculateHashes: calculateHashes,
             exportCsv: exportCsv,
+            saveProject: saveProject,
+            loadProject: loadProject,
+            exportXlsx: exportXlsx,
             clearRows: clearRows,
+            cancelCurrent: cancelCurrent,
         };
     },
 });

@@ -1,19 +1,27 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Local, SecondsFormat};
+use exif::{In, Reader as ExifReader, Tag, Value};
+use image::{DynamicImage, ImageFormat};
 use md5::{Digest as Md5Digest, Md5};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use sha2::Sha256;
 use std::{
     collections::HashSet,
     fs,
-    io::{self, Read},
+    io::{self, Cursor, Read},
     path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex},
     time::SystemTime,
 };
+use tauri::{AppHandle, Emitter, State};
 use walkdir::WalkDir;
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct FileEntry {
     id: String,
     name: String,
@@ -27,15 +35,35 @@ struct FileEntry {
     title: String,
     md5: String,
     sha256: String,
+    thumbnail: String,
+    width: String,
+    height: String,
+    duration: String,
+    bit_rate: String,
+    sample_rate: String,
+    channels: String,
+    camera_make: String,
+    camera_model: String,
+    date_taken: String,
+    iso: String,
+    f_number: String,
+    focal_length: String,
+    latitude: String,
+    longitude: String,
+    album: String,
+    artist: String,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ScanResponse {
     entries: Vec<FileEntry>,
     errors: Vec<String>,
+    cancelled: bool,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct HashResult {
     path: String,
     md5: String,
@@ -43,6 +71,40 @@ struct HashResult {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct Progress {
+    job_id: String,
+    current: usize,
+    total: usize,
+    stage: String,
+    path: String,
+    cancelled: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectFile {
+    version: u32,
+    entries: Vec<FileEntry>,
+    visible_columns: Vec<String>,
+    excluded_dirs: Vec<String>,
+    excluded_extensions: Vec<String>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    cancelled: Arc<Mutex<HashSet<String>>>,
+}
+
+fn is_cancelled(state: &Arc<Mutex<HashSet<String>>>, id: &str) -> bool {
+    state.lock().map(|set| set.contains(id)).unwrap_or(false)
+}
+fn clear_job(state: &Arc<Mutex<HashSet<String>>>, id: &str) {
+    if let Ok(mut set) = state.lock() {
+        set.remove(id);
+    }
+}
 fn format_time(time: Option<SystemTime>) -> String {
     time.map(|value| {
         let date: DateTime<Local> = value.into();
@@ -50,29 +112,127 @@ fn format_time(time: Option<SystemTime>) -> String {
     })
     .unwrap_or_default()
 }
-
+fn ext(path: &Path) -> String {
+    path.extension()
+        .map(|v| v.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+fn text_exif(field: Option<&Value>) -> String {
+    match field {
+        Some(Value::Ascii(values)) => values
+            .first()
+            .map(|v| String::from_utf8_lossy(v).trim().to_string())
+            .unwrap_or_default(),
+        Some(value) => format!("{value:?}"),
+        None => String::new(),
+    }
+}
+fn thumbnail(path: &Path) -> String {
+    let Ok(image) = image::open(path) else {
+        return String::new();
+    };
+    let image: DynamicImage = image.thumbnail(180, 180);
+    let mut bytes = Cursor::new(Vec::new());
+    if image.write_to(&mut bytes, ImageFormat::Jpeg).is_ok() {
+        format!(
+            "data:image/jpeg;base64,{}",
+            BASE64.encode(bytes.into_inner())
+        )
+    } else {
+        String::new()
+    }
+}
+fn ffprobe(path: &Path) -> (String, String, String, String, String, String, String) {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            &path.to_string_lossy(),
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Default::default();
+    };
+    let Ok(json) = serde_json::from_slice::<JsonValue>(&output.stdout) else {
+        return Default::default();
+    };
+    let format = json.get("format").cloned().unwrap_or_default();
+    let streams = json
+        .get("streams")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let stream = streams
+        .iter()
+        .find(|v| v.get("codec_type").and_then(|v| v.as_str()) == Some("audio"))
+        .or_else(|| {
+            streams
+                .iter()
+                .find(|v| v.get("codec_type").and_then(|v| v.as_str()) == Some("video"))
+        });
+    let s = stream.cloned().unwrap_or_default();
+    let duration = format
+        .get("duration")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let bitrate = format
+        .get("bit_rate")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let sample_rate = s
+        .get("sample_rate")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let channels = s.get("channels").map(|v| v.to_string()).unwrap_or_default();
+    let width = s.get("width").map(|v| v.to_string()).unwrap_or_default();
+    let height = s.get("height").map(|v| v.to_string()).unwrap_or_default();
+    let tags = s
+        .get("tags")
+        .or_else(|| format.get("tags"))
+        .cloned()
+        .unwrap_or_default();
+    let album = tags
+        .get("album")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let artist = tags
+        .get("artist")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    (
+        duration,
+        bitrate,
+        sample_rate,
+        channels,
+        width,
+        height,
+        format!("{}|{}", album, artist),
+    )
+}
 fn entry_from_path(path: &Path) -> Result<FileEntry, String> {
-    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
     let is_dir = metadata.is_dir();
     let path_string = path.to_string_lossy().to_string();
     let name = path
         .file_name()
-        .map(|value| value.to_string_lossy().to_string())
+        .map(|v| v.to_string_lossy().to_string())
         .unwrap_or_else(|| path_string.clone());
-    let kind = if is_dir {
-        "Folder".to_string()
-    } else {
-        path.extension()
-            .map(|value| value.to_string_lossy().to_lowercase())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "file".to_string())
-    };
-    Ok(FileEntry {
+    let kind = if is_dir { "Folder".into() } else { ext(path) };
+    let mut entry = FileEntry {
         id: path_string.clone(),
         name,
         modified: format_time(metadata.modified().ok()),
         created: format_time(metadata.created().ok()),
-        kind,
+        kind: kind.clone(),
         size: if is_dir { 0 } else { metadata.len() },
         path: path_string,
         comments: String::new(),
@@ -80,69 +240,216 @@ fn entry_from_path(path: &Path) -> Result<FileEntry, String> {
         title: String::new(),
         md5: String::new(),
         sha256: String::new(),
-    })
+        thumbnail: String::new(),
+        width: String::new(),
+        height: String::new(),
+        duration: String::new(),
+        bit_rate: String::new(),
+        sample_rate: String::new(),
+        channels: String::new(),
+        camera_make: String::new(),
+        camera_model: String::new(),
+        date_taken: String::new(),
+        iso: String::new(),
+        f_number: String::new(),
+        focal_length: String::new(),
+        latitude: String::new(),
+        longitude: String::new(),
+        album: String::new(),
+        artist: String::new(),
+    };
+    if !is_dir {
+        if let Ok(file) = fs::File::open(path) {
+            let mut reader = io::BufReader::new(file);
+            if let Ok(exif) = ExifReader::new().read_from_container(&mut reader) {
+                entry.camera_make =
+                    text_exif(exif.get_field(Tag::Make, In::PRIMARY).map(|f| &f.value));
+                entry.camera_model =
+                    text_exif(exif.get_field(Tag::Model, In::PRIMARY).map(|f| &f.value));
+                entry.date_taken = text_exif(
+                    exif.get_field(Tag::DateTimeOriginal, In::PRIMARY)
+                        .map(|f| &f.value),
+                );
+                entry.iso = text_exif(
+                    exif.get_field(Tag::PhotographicSensitivity, In::PRIMARY)
+                        .map(|f| &f.value),
+                );
+                entry.f_number =
+                    text_exif(exif.get_field(Tag::FNumber, In::PRIMARY).map(|f| &f.value));
+                entry.focal_length = text_exif(
+                    exif.get_field(Tag::FocalLength, In::PRIMARY)
+                        .map(|f| &f.value),
+                );
+            }
+        }
+        if let Ok((w, h)) = image::image_dimensions(path) {
+            entry.width = w.to_string();
+            entry.height = h.to_string();
+            entry.thumbnail = thumbnail(path);
+        }
+        let (duration, bitrate, sample, channels, w, h, tags) = ffprobe(path);
+        if !duration.is_empty() {
+            entry.duration = duration;
+            entry.bit_rate = bitrate;
+            entry.sample_rate = sample;
+            entry.channels = channels;
+            if entry.width.is_empty() {
+                entry.width = w;
+                entry.height = h;
+            }
+            let mut parts = tags.splitn(2, '|');
+            entry.album = parts.next().unwrap_or_default().to_string();
+            entry.artist = parts.next().unwrap_or_default().to_string();
+        }
+    }
+    Ok(entry)
 }
 
-fn scan_entries_blocking(paths: Vec<String>, recursive: bool) -> ScanResponse {
-    let mut entries = Vec::new();
-    let mut errors = Vec::new();
-    let mut seen = HashSet::new();
-    for raw_path in paths {
-        let root = PathBuf::from(&raw_path);
+fn scan_blocking(
+    paths: Vec<String>,
+    recursive: bool,
+    excluded_dirs: Vec<String>,
+    excluded_extensions: Vec<String>,
+    job_id: String,
+    app: AppHandle,
+    cancelled: Arc<Mutex<HashSet<String>>>,
+) -> ScanResponse {
+    let mut candidates = Vec::new();
+    let excluded_dirs: HashSet<String> = excluded_dirs
+        .into_iter()
+        .map(|v| v.to_lowercase())
+        .collect();
+    let excluded_extensions: HashSet<String> = excluded_extensions
+        .into_iter()
+        .map(|v| v.trim_start_matches('.').to_lowercase())
+        .collect();
+    for raw in paths {
+        let root = PathBuf::from(&raw);
         if !root.exists() {
-            errors.push(format!("{}: path does not exist", raw_path));
             continue;
         }
         let walker = if root.is_dir() {
-            let mut builder = WalkDir::new(&root).min_depth(0);
+            let mut w = WalkDir::new(&root).min_depth(0);
             if !recursive {
-                builder = builder.max_depth(1);
+                w = w.max_depth(1);
             }
-            builder.into_iter()
+            w.into_iter()
         } else {
             WalkDir::new(&root).max_depth(0).into_iter()
         };
-        for result in walker {
-            match result {
-                Ok(item) => {
-                    let item_path = item.path();
-                    let key = item_path.to_string_lossy().to_string();
-                    if !seen.insert(key) {
-                        continue;
-                    }
-                    match entry_from_path(item_path) {
-                        Ok(entry) => entries.push(entry),
-                        Err(error) => errors.push(format!("{}: {}", item_path.display(), error)),
-                    }
+        for result in walker.filter_entry(|item| {
+            let p = item.path();
+            !p.is_dir()
+                || !excluded_dirs.contains(
+                    &p.file_name()
+                        .map(|v| v.to_string_lossy().to_lowercase())
+                        .unwrap_or_default(),
+                )
+        }) {
+            if let Ok(item) = result {
+                let p = item.path().to_path_buf();
+                if p.is_file() && excluded_extensions.contains(&ext(&p)) {
+                    continue;
                 }
-                Err(error) => errors.push(error.to_string()),
+                candidates.push(p);
             }
         }
     }
-    entries.sort_by_key(|entry| entry.name.to_lowercase());
-    ScanResponse { entries, errors }
+    let total = candidates.len();
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+    let _ = app.emit(
+        "scan-progress",
+        Progress {
+            job_id: job_id.clone(),
+            current: 0,
+            total,
+            stage: "scanning".into(),
+            path: String::new(),
+            cancelled: false,
+        },
+    );
+    for (index, path) in candidates.iter().enumerate() {
+        if is_cancelled(&cancelled, &job_id) {
+            let _ = app.emit(
+                "scan-progress",
+                Progress {
+                    job_id: job_id.clone(),
+                    current: index,
+                    total,
+                    stage: "cancelled".into(),
+                    path: path.to_string_lossy().into(),
+                    cancelled: true,
+                },
+            );
+            break;
+        }
+        match entry_from_path(path) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => errors.push(format!("{}: {e}", path.display())),
+        };
+        let _ = app.emit(
+            "scan-progress",
+            Progress {
+                job_id: job_id.clone(),
+                current: index + 1,
+                total,
+                stage: "scanning".into(),
+                path: path.to_string_lossy().into(),
+                cancelled: false,
+            },
+        );
+    }
+    let was_cancelled = is_cancelled(&cancelled, &job_id);
+    clear_job(&cancelled, &job_id);
+    ScanResponse {
+        entries,
+        errors,
+        cancelled: was_cancelled,
+    }
 }
 
-fn calculate_one(path: &Path) -> HashResult {
+fn hash_one(
+    path: &Path,
+    job_id: &str,
+    app: &AppHandle,
+    cancelled: &Arc<Mutex<HashSet<String>>>,
+    current: usize,
+    total: usize,
+) -> HashResult {
     let path_string = path.to_string_lossy().to_string();
     let result = (|| -> io::Result<(String, String)> {
         let mut file = fs::File::open(path)?;
         let mut md5_hasher = Md5::new();
-        let mut sha256_hasher = Sha256::new();
+        let mut sha_hasher = Sha256::new();
         let mut buffer = [0_u8; 1024 * 1024];
         loop {
+            if is_cancelled(cancelled, job_id) {
+                break;
+            }
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
             md5_hasher.update(&buffer[..read]);
-            sha256_hasher.update(&buffer[..read]);
+            sha_hasher.update(&buffer[..read]);
         }
         Ok((
             hex::encode(md5_hasher.finalize()),
-            hex::encode(sha256_hasher.finalize()),
+            hex::encode(sha_hasher.finalize()),
         ))
     })();
+    let _ = app.emit(
+        "hash-progress",
+        Progress {
+            job_id: job_id.into(),
+            current,
+            total,
+            stage: "hashing".into(),
+            path: path_string.clone(),
+            cancelled: is_cancelled(cancelled, job_id),
+        },
+    );
     match result {
         Ok((md5, sha256)) => HashResult {
             path: path_string,
@@ -150,52 +457,113 @@ fn calculate_one(path: &Path) -> HashResult {
             sha256,
             error: None,
         },
-        Err(error) => HashResult {
+        Err(e) => HashResult {
             path: path_string,
             md5: String::new(),
             sha256: String::new(),
-            error: Some(error.to_string()),
+            error: Some(e.to_string()),
         },
     }
 }
 
 #[tauri::command]
-async fn scan_entries(paths: Vec<String>, recursive: bool) -> Result<ScanResponse, String> {
-    tauri::async_runtime::spawn_blocking(move || scan_entries_blocking(paths, recursive))
-        .await
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-async fn calculate_hashes(paths: Vec<String>) -> Result<Vec<HashResult>, String> {
+async fn scan_entries(
+    paths: Vec<String>,
+    recursive: bool,
+    excluded_dirs: Vec<String>,
+    excluded_extensions: Vec<String>,
+    job_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ScanResponse, String> {
+    let cancelled = state.cancelled.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        paths
-            .iter()
-            .map(|path| calculate_one(Path::new(path)))
-            .collect()
+        scan_blocking(
+            paths,
+            recursive,
+            excluded_dirs,
+            excluded_extensions,
+            job_id,
+            app,
+            cancelled,
+        )
     })
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|e| e.to_string())
 }
-
+#[tauri::command]
+fn cancel_scan(job_id: String, state: State<'_, AppState>) {
+    if let Ok(mut set) = state.cancelled.lock() {
+        set.insert(job_id);
+    }
+}
+#[tauri::command]
+async fn calculate_hashes(
+    paths: Vec<String>,
+    job_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<HashResult>, String> {
+    let cancelled = state.cancelled.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let total = paths.len();
+        let values = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| hash_one(Path::new(p), &job_id, &app, &cancelled, i + 1, total))
+            .collect();
+        clear_job(&cancelled, &job_id);
+        values
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn cancel_hashes(job_id: String, state: State<'_, AppState>) {
+    if let Ok(mut set) = state.cancelled.lock() {
+        set.insert(job_id);
+    }
+}
 #[tauri::command]
 fn save_csv(path: String, content: String) -> Result<(), String> {
-    fs::write(path, content).map_err(|error| error.to_string())
+    fs::write(path, content).map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn save_binary_base64(path: String, content: String) -> Result<(), String> {
+    let bytes = BASE64.decode(content).map_err(|e| e.to_string())?;
+    fs::write(path, bytes).map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn save_project(path: String, project: ProjectFile) -> Result<(), String> {
+    let data = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
+    fs::write(path, data).map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn load_project(path: String) -> Result<ProjectFile, String> {
+    let data = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&data).map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(AppState {
+            cancelled: Arc::new(Mutex::new(HashSet::new())),
+        })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             scan_entries,
+            cancel_scan,
             calculate_hashes,
-            save_csv
+            cancel_hashes,
+            save_csv,
+            save_binary_base64,
+            save_project,
+            load_project
         ])
         .run(tauri::generate_context!())
         .expect("error while running File List Studio");
 }
-
 fn main() {
     run();
 }

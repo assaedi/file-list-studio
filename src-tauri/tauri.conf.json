@@ -25,12 +25,8 @@
     }
   },
   "bundle": {
-  "active": true,
-  "targets": ["nsis", "msi"],
-  "icon": [
-    "icons/icon.ico",
-    "icons/icon.png"
-  ]
-}
-
+    "active": true,
+    "targets": ["nsis", "msi", "deb"],
+    "icon": ["icons/icon.ico", "icons/icon.png"]
+  }
 }
