@@ -4,7 +4,6 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { listen } from '@tauri-apps/api/event'
-import * as XLSX from 'xlsx'
 
 type ScanState = 'idle' | 'scanning' | 'completed' | 'error'
 type TypeFilter = 'all' | 'images' | 'videos' | 'audio' | 'pdf' | 'custom'
@@ -249,11 +248,6 @@ async function calculateHashes(): Promise<void> {
   statusMessage.value = `اكتمل حساب البصمات لـ ${targets.length} ملف${errors.value.length ? ` مع ${errors.value.length} أخطاء` : ''}.`
 }
 
-function csvEscape(value: string | number): string {
-  const text = String(value)
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
-}
-
 async function exportCsv(): Promise<void> {
   if (filteredRows.value.length === 0 || visibleColumns.value.length === 0) {
     statusMessage.value = 'لا توجد بيانات أو أعمدة مرئية للتصدير.'
@@ -261,11 +255,10 @@ async function exportCsv(): Promise<void> {
   }
   const selectedPath = await save({ title: 'احفظ قائمة الملفات', defaultPath: 'file-list.csv', filters: [{ name: 'CSV', extensions: ['csv'] }] })
   if (!selectedPath) return
-  const header = visibleColumns.value.map((column) => csvEscape(columnLabels[column])).join(',')
-  const body = filteredRows.value.map((row) => visibleColumns.value.map((column) => csvEscape(displayValue(row, column))).join(',')).join('\r\n')
-  const content = `\uFEFF${header}\r\n${body}\r\n`
+  const columns = visibleColumns.value
+  const headers = columns.map((column) => localizedColumnLabel(column))
   try {
-    await invoke('save_csv', { path: selectedPath, content })
+    await invoke('export_csv', { path: selectedPath, request: { entries: filteredRows.value, columns, headers } })
     statusMessage.value = `تم تصدير ${filteredRows.value.length.toLocaleString()} سجل إلى ${selectedPath}.`
   } catch (error) {
     state.value = 'error'
@@ -291,10 +284,9 @@ async function exportXlsx(): Promise<void> {
   if (filteredRows.value.length === 0 || visibleColumns.value.length === 0) { statusMessage.value = 'لا توجد بيانات للتصدير.'; return }
   const path = await save({ title: 'احفظ ملف Excel', defaultPath: 'file-list.xlsx', filters: [{ name: 'Excel Workbook', extensions: ['xlsx'] }] })
   if (!path) return
-  const data = filteredRows.value.map((row) => Object.fromEntries(visibleColumns.value.map((column) => [columnLabels[column], displayValue(row, column)])))
-  const workbook = XLSX.utils.book_new(); const sheet = XLSX.utils.json_to_sheet(data); XLSX.utils.book_append_sheet(workbook, sheet, 'File List')
-  const base64 = XLSX.write(workbook, { bookType: 'xlsx', type: 'base64' })
-  try { await invoke('save_binary_base64', { path, content: base64 }); statusMessage.value = `تم تصدير ${filteredRows.value.length.toLocaleString()} سجل إلى Excel.` } catch (error) { errors.value = [String(error)]; state.value = 'error'; statusMessage.value = `فشل تصدير Excel: ${String(error)}` }
+  const columns = visibleColumns.value
+  const headers = columns.map((column) => localizedColumnLabel(column))
+  try { await invoke('export_xlsx', { path, request: { entries: filteredRows.value, columns, headers } }); statusMessage.value = `تم تصدير ${filteredRows.value.length.toLocaleString()} سجل إلى Excel.` } catch (error) { errors.value = [String(error)]; state.value = 'error'; statusMessage.value = `فشل تصدير Excel: ${String(error)}` }
 }
 
 async function clearRows(): Promise<void> {

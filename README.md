@@ -1,6 +1,6 @@
 # File List Studio
 
-File List Studio is a native Tauri 2 desktop application for creating structured catalogs of local files and folders. The frontend uses Vue 3, TypeScript, and XLSX; filesystem scanning, metadata extraction, thumbnails, hashing, project persistence, and binary file saving are implemented through Rust commands.
+File List Studio is a native Tauri 2 desktop application for creating structured catalogs of local files and folders. The frontend uses Vue 3 and TypeScript; filesystem scanning, metadata extraction, thumbnails, hashing, project persistence, and CSV/XLSX export are implemented through Rust commands.
 
 ## Run in development
 
@@ -17,7 +17,7 @@ For image dimensions, EXIF, audio/video duration, resolution, bitrate, sample ra
 
 The application scans selected files and folders, optionally includes subfolders, and supports comma-separated excluded folder names and extensions. It reports exact progress, continues past individual read errors, and can cancel active scans or hash jobs. Results include filesystem dates, type, size, path, EXIF fields, image dimensions and thumbnails, media duration and technical properties, and audio tags when the source exposes them.
 
-The result table supports search, type filtering, sorting, column visibility, inline editing of name/comments/tags/title, and MD5/SHA-256 calculation on demand. Projects can be saved to and reopened from `.flsp` files. The current filtered view can be exported as UTF-8 CSV or as an XLSX workbook. The interface includes Arabic and English modes through the language toggle.
+The result table supports search, type filtering, sorting, column visibility, inline editing of name/comments/tags/title, and MD5/SHA-256 calculation on demand. Projects can be saved to and reopened from `.flsp` files. Rust writes the current filtered view directly to UTF-8 CSV with a BOM for reliable Arabic/Excel handling, or to a native XLSX workbook. The interface includes Arabic and English modes through the language toggle.
 
 ## Build a distributable application
 

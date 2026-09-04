@@ -5,6 +5,7 @@ use chrono::{DateTime, Local, SecondsFormat};
 use exif::{In, Reader as ExifReader, Tag, Value};
 use image::{DynamicImage, ImageFormat};
 use md5::{Digest as Md5Digest, Md5};
+use rust_xlsxwriter::Workbook;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::Sha256;
@@ -524,14 +525,105 @@ fn cancel_hashes(job_id: String, state: State<'_, AppState>) {
         set.insert(job_id);
     }
 }
-#[tauri::command]
-fn save_csv(path: String, content: String) -> Result<(), String> {
-    fs::write(path, content).map_err(|e| e.to_string())
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportRequest {
+    entries: Vec<FileEntry>,
+    columns: Vec<String>,
+    headers: Vec<String>,
 }
+
+fn export_value(entry: &FileEntry, column: &str) -> String {
+    match column {
+        "name" => entry.name.clone(),
+        "modified" => entry.modified.clone(),
+        "created" => entry.created.clone(),
+        "kind" => entry.kind.clone(),
+        "size" => entry.size.to_string(),
+        "path" => entry.path.clone(),
+        "comments" => entry.comments.clone(),
+        "tags" => entry.tags.clone(),
+        "title" => entry.title.clone(),
+        "md5" => entry.md5.clone(),
+        "sha256" => entry.sha256.clone(),
+        "thumbnail" => entry.thumbnail.clone(),
+        "width" => entry.width.clone(),
+        "height" => entry.height.clone(),
+        "duration" => entry.duration.clone(),
+        "bitRate" => entry.bit_rate.clone(),
+        "sampleRate" => entry.sample_rate.clone(),
+        "channels" => entry.channels.clone(),
+        "cameraMake" => entry.camera_make.clone(),
+        "cameraModel" | "cameraModelName" => entry.camera_model.clone(),
+        "dateTaken" => entry.date_taken.clone(),
+        "iso" => entry.iso.clone(),
+        "fNumber" => entry.f_number.clone(),
+        "focalLength" => entry.focal_length.clone(),
+        "latitude" => entry.latitude.clone(),
+        "longitude" => entry.longitude.clone(),
+        "album" => entry.album.clone(),
+        "artist" | "authors" => entry.artist.clone(),
+        _ => String::new(),
+    }
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\r', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 #[tauri::command]
-fn save_binary_base64(path: String, content: String) -> Result<(), String> {
-    let bytes = BASE64.decode(content).map_err(|e| e.to_string())?;
-    fs::write(path, bytes).map_err(|e| e.to_string())
+fn export_csv(path: String, request: ExportRequest) -> Result<(), String> {
+    if request.headers.len() != request.columns.len() {
+        return Err("Headers and columns must have the same length".into());
+    }
+    let mut content = String::from("\u{FEFF}");
+    content.push_str(
+        &request
+            .headers
+            .iter()
+            .map(|value| csv_escape(value))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    content.push('\n');
+    for entry in &request.entries {
+        content.push_str(
+            &request
+                .columns
+                .iter()
+                .map(|column| csv_escape(&export_value(entry, column)))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        content.push('\n');
+    }
+    fs::write(path, content.as_bytes()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn export_xlsx(path: String, request: ExportRequest) -> Result<(), String> {
+    if request.headers.len() != request.columns.len() {
+        return Err("Headers and columns must have the same length".into());
+    }
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    for (col, header) in request.headers.iter().enumerate() {
+        worksheet
+            .write_string(0, col as u16, header)
+            .map_err(|e| e.to_string())?;
+    }
+    for (row, entry) in request.entries.iter().enumerate() {
+        for (col, column) in request.columns.iter().enumerate() {
+            worksheet
+                .write_string((row + 1) as u32, col as u16, &export_value(entry, column))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    workbook.save(path).map_err(|e| e.to_string())
 }
 #[tauri::command]
 fn save_project(path: String, project: ProjectFile) -> Result<(), String> {
@@ -556,8 +648,8 @@ pub fn run() {
             cancel_scan,
             calculate_hashes,
             cancel_hashes,
-            save_csv,
-            save_binary_base64,
+            export_csv,
+            export_xlsx,
             save_project,
             load_project
         ])

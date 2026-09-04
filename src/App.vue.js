@@ -3,7 +3,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
-import * as XLSX from 'xlsx';
 const requiredColumns = ['name', 'modified', 'created', 'kind', 'size', 'path', 'comments', 'tags', 'title', 'md5', 'sha256'];
 const optionalColumns = ['thumbnail', 'width', 'height', 'duration', 'bitRate', 'sampleRate', 'channels', 'cameraMake', 'cameraModel', 'dateTaken', 'iso', 'fNumber', 'focalLength', 'album', 'artist', 'version', 'pages', 'authors', 'trackNo', 'genre', 'year', 'audioBitRate', 'audioSampleRate', 'audioChannels', 'dimensions', 'pixelWidth', 'pixelHeight', 'cameraModelName', 'latitude', 'longitude', 'mapsUrl'];
 const defaultVisibleColumns = ['name', 'modified', 'kind', 'size', 'path', 'comments', 'tags', 'title', 'md5', 'sha256'];
@@ -190,10 +189,6 @@ async function calculateHashes() {
     state.value = errors.value.length > 0 ? 'error' : 'completed';
     statusMessage.value = `اكتمل حساب البصمات لـ ${targets.length} ملف${errors.value.length ? ` مع ${errors.value.length} أخطاء` : ''}.`;
 }
-function csvEscape(value) {
-    const text = String(value);
-    return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
-}
 async function exportCsv() {
     if (filteredRows.value.length === 0 || visibleColumns.value.length === 0) {
         statusMessage.value = 'لا توجد بيانات أو أعمدة مرئية للتصدير.';
@@ -202,11 +197,10 @@ async function exportCsv() {
     const selectedPath = await save({ title: 'احفظ قائمة الملفات', defaultPath: 'file-list.csv', filters: [{ name: 'CSV', extensions: ['csv'] }] });
     if (!selectedPath)
         return;
-    const header = visibleColumns.value.map((column) => csvEscape(columnLabels[column])).join(',');
-    const body = filteredRows.value.map((row) => visibleColumns.value.map((column) => csvEscape(displayValue(row, column))).join(',')).join('\r\n');
-    const content = `\uFEFF${header}\r\n${body}\r\n`;
+    const columns = visibleColumns.value;
+    const headers = columns.map((column) => localizedColumnLabel(column));
     try {
-        await invoke('save_csv', { path: selectedPath, content });
+        await invoke('export_csv', { path: selectedPath, request: { entries: filteredRows.value, columns, headers } });
         statusMessage.value = `تم تصدير ${filteredRows.value.length.toLocaleString()} سجل إلى ${selectedPath}.`;
     }
     catch (error) {
@@ -261,13 +255,10 @@ async function exportXlsx() {
     const path = await save({ title: 'احفظ ملف Excel', defaultPath: 'file-list.xlsx', filters: [{ name: 'Excel Workbook', extensions: ['xlsx'] }] });
     if (!path)
         return;
-    const data = filteredRows.value.map((row) => Object.fromEntries(visibleColumns.value.map((column) => [columnLabels[column], displayValue(row, column)])));
-    const workbook = XLSX.utils.book_new();
-    const sheet = XLSX.utils.json_to_sheet(data);
-    XLSX.utils.book_append_sheet(workbook, sheet, 'File List');
-    const base64 = XLSX.write(workbook, { bookType: 'xlsx', type: 'base64' });
+    const columns = visibleColumns.value;
+    const headers = columns.map((column) => localizedColumnLabel(column));
     try {
-        await invoke('save_binary_base64', { path, content: base64 });
+        await invoke('export_xlsx', { path, request: { entries: filteredRows.value, columns, headers } });
         statusMessage.value = `تم تصدير ${filteredRows.value.length.toLocaleString()} سجل إلى Excel.`;
     }
     catch (error) {
