@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Mutex},
     time::SystemTime,
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -143,8 +143,19 @@ fn thumbnail(path: &Path) -> String {
         String::new()
     }
 }
-fn ffprobe(path: &Path) -> (String, String, String, String, String, String, String) {
-    let output = Command::new("ffprobe")
+fn ffprobe(
+    app: &AppHandle,
+    path: &Path,
+) -> (String, String, String, String, String, String, String) {
+    let bundled = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|dir| dir.join("bin").join("ffprobe.exe"));
+    let executable = bundled
+        .filter(|candidate| candidate.exists())
+        .unwrap_or_else(|| PathBuf::from("ffprobe"));
+    let output = Command::new(executable)
         .args([
             "-v",
             "quiet",
@@ -219,7 +230,7 @@ fn ffprobe(path: &Path) -> (String, String, String, String, String, String, Stri
         format!("{}|{}", album, artist),
     )
 }
-fn entry_from_path(path: &Path) -> Result<FileEntry, String> {
+fn entry_from_path(app: &AppHandle, path: &Path) -> Result<FileEntry, String> {
     let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
     let is_dir = metadata.is_dir();
     let path_string = path.to_string_lossy().to_string();
@@ -288,7 +299,7 @@ fn entry_from_path(path: &Path) -> Result<FileEntry, String> {
             entry.height = h.to_string();
             entry.thumbnail = thumbnail(path);
         }
-        let (duration, bitrate, sample, channels, w, h, tags) = ffprobe(path);
+        let (duration, bitrate, sample, channels, w, h, tags) = ffprobe(app, path);
         if !duration.is_empty() {
             entry.duration = duration;
             entry.bit_rate = bitrate;
@@ -385,7 +396,7 @@ fn scan_blocking(
             );
             break;
         }
-        match entry_from_path(path) {
+        match entry_from_path(&app, path) {
             Ok(entry) => entries.push(entry),
             Err(e) => errors.push(format!("{}: {e}", path.display())),
         };

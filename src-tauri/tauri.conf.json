@@ -27,6 +27,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "msi", "deb"],
-    "icon": ["icons/icon.ico", "icons/icon.png"]
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": ["bin/ffprobe.exe", "bin/FFMPEG-LICENSE.txt"]
   }
 }
